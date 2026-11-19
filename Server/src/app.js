@@ -9,6 +9,12 @@ import { errorHandler } from './middlewares/errorHandler.js';
 
 const app = express();
 
+// Behind a proxy (ngrok, cloudflared, load balancer): trust X-Forwarded-For for req.ip
+if (env.TRUST_PROXY) {
+  const value = env.TRUST_PROXY;
+  app.set('trust proxy', /^\d+$/.test(value) ? Number(value) : value === 'true' ? true : value);
+}
+
 // Security & parsing
 app.use(helmet());
 app.use(

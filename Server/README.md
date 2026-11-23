@@ -69,6 +69,11 @@ To add columns, update `COLUMNS` in `src/services/users.service.js` and the zod 
 | POST   | `/api/users`     | 201     | 400, 409      |
 | PUT    | `/api/users/:id` | 200     | 400, 404, 409 |
 | DELETE | `/api/users/:id` | 204     | 400, 404      |
+| GET    | `/api/stops/:code` | 200   | 400, 404      |
+
+`GET /api/stops/:code` returns the stop name for the number on the stop sign (GTFS `stop_code`,
+1-5 digits): `{ "success": true, "data": { "stop_code": 638, "stop_name": "מחלף חמד" } }`.
+In code: `getStopNameByCode(638)` from `src/services/stops.service.js`.
 
 Response format:
 
@@ -248,3 +253,66 @@ An ID number is sensitive personal data. Before storing IDs (or call records lin
 - Keep `LOG_FULL_ID=false` in production. Error logs never contain the keyed ID.
 
 > The older `/yemot/incoming` route (welcome message only) still exists and is unchanged.
+
+## GTFS data (Ministry of Transport timetables)
+
+`npm run gtfs:import` downloads the official feed
+(`https://gtfs.mot.gov.il/gtfsfiles/israel-public-transportation.zip`, ~140MB) and loads it
+into Postgres. Requires `DATABASE_URL` in `.env` (see `.env.example`). Takes about 2 minutes.
+
+```bash
+npm run gtfs:import                      # download + import
+npm run gtfs:import -- --skip-download   # reuse data/gtfs/israel-public-transportation.zip
+```
+
+How it works (`scripts/gtfs-import.js`):
+
+1. Downloads to `data/gtfs/` (git-ignored), 3 attempts, checks the size.
+2. Reads the zip locally. Refuses to load a feed with suspiciously few rows.
+3. `stop_times.txt` (~10M rows, too big for the Supabase free tier) is **not stored**. It is
+   compressed into stop patterns and timing profiles. Times are reconstructed exactly.
+4. Loads everything into the `gtfs_staging` schema with `COPY` (all foreign keys checked).
+5. Swaps the staging tables into `public` in one transaction. On failure the previous data stays.
+6. Logs the run in `gtfs_feeds`.
+
+Schema: `db/gtfs_schema.sql` (data tables, replaced on every import) and `db/gtfs_feeds.sql`
+(import log, kept).
+
+| Table                  | Content                                                        |
+| ---------------------- | -------------------------------------------------------------- |
+| `gtfs_agency`          | Operators                                                      |
+| `gtfs_stops`           | Stops; `stop_code` is the number on the stop sign              |
+| `gtfs_routes`          | Lines (one row per line + direction + alternative)             |
+| `gtfs_calendar`        | Days and date range of each `service_id`                       |
+| `gtfs_patterns`        | Distinct ordered stop lists of a route                         |
+| `gtfs_pattern_stops`   | Stops of a pattern in order (`stop_sequence` 1..n)             |
+| `gtfs_timing_profiles` | Distinct timings of a pattern                                  |
+| `gtfs_profile_offsets` | Seconds after the origin departure at each stop               |
+| `gtfs_trips`           | Trips; `origin_departure_sec` = departure from the first stop  |
+| `gtfs_feeds`           | Import log                                                     |
+
+View `gtfs_trip_stop_times` gives the planned time of every trip at every stop.
+All times are **seconds after midnight** of the service day and can exceed 24h (after-midnight trips).
+
+```sql
+-- Lines that stop at stop sign 638, with planned times
+select r.route_short_name, a.agency_name,
+       to_char(make_interval(secs => v.departure_sec), 'HH24:MI') as planned
+from gtfs_trip_stop_times v
+join gtfs_stops  s using (stop_id)
+join gtfs_routes r using (route_id)
+join gtfs_agency a using (agency_id)
+where s.stop_code = 638
+order by v.departure_sec;
+```
+
+Notes:
+
+- Every import **drops and recreates** the `gtfs_*` data tables (`DROP ... CASCADE`). Do not add
+  foreign keys from other tables (for example complaints) to them. Copy the values instead.
+- `route_id` / `trip_id` / `stop_id` can change between feeds. Store `stop_code`, line number and
+  operator in complaints.
+- RLS is enabled with no policies; only the server key (`service_role`) can read the tables.
+- The DB connection uses TLS without CA verification (`rejectUnauthorized: false`), because
+  Supabase uses its own CA.
+- History (keeping ~1 month of past days) and the nightly schedule are not implemented yet.

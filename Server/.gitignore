@@ -6,3 +6,6 @@ npm-debug.log*
 logs/
 *.log
 .DS_Store
+
+# GTFS downloads (large, regenerated daily)
+data/

@@ -1,0 +1,47 @@
+# Nightly import of the Ministry of Transport GTFS feed into Supabase
+# (current schedule + 35-day history). See Server/README.md, "GTFS data".
+#
+# Needs the repository secret DATABASE_URL (Settings > Secrets and variables > Actions).
+# Scheduled workflows run only from the default branch (main).
+# GitHub sends an email to the repo owner when a run fails.
+
+name: GTFS nightly import
+
+on:
+  schedule:
+    # 01:00 UTC = 03:00 Israel winter time (04:00 in summer). GitHub may start a few minutes late.
+    - cron: '0 1 * * *'
+  workflow_dispatch: {}   # "Run workflow" button for manual runs
+
+concurrency:
+  group: gtfs-import
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: Server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Server/package-lock.json
+
+      - run: npm ci
+
+      - name: Import GTFS (current + history)
+        run: npm run gtfs:import
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # Past days are not filled automatically. To fill a missed day by hand:
+      #   npm run gtfs:backfill -- --date YYYY-MM-DD

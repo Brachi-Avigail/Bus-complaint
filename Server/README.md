@@ -315,4 +315,49 @@ Notes:
 - RLS is enabled with no policies; only the server key (`service_role`) can read the tables.
 - The DB connection uses TLS without CA verification (`rejectUnauthorized: false`), because
   Supabase uses its own CA.
-- History (keeping ~1 month of past days) and the nightly schedule are not implemented yet.
+
+### History (planned schedule of the last 35 days)
+
+The `gtfs_*` tables only hold the current feed, which covers today and the coming weeks.
+For past dates, every import also saves **today's** plan into the `hist_*` tables
+(`db/gtfs_history.sql`, never dropped), and deletes days older than `GTFS_HISTORY_DAYS` (default 35).
+
+Rows are content-addressed (`*_key` = md5 of the content, as uuid). An unchanged stop, route, stop
+list, timing, trip or service group is stored once, however many days use it. Each day only adds
+`hist_service_days` rows (~10k): which service groups ran on that date. `hist_days` lists the
+covered dates and the file each came from.
+
+```sql
+-- Planned departures of line 480 from stop sign 4170 on 2026-11-10 (local time)
+select planned_at, agency_name, route_long_name
+from gtfs_planned_departures('2026-11-10', 4170, '480');
+
+-- Is the date covered at all? (no rows above + not covered = unknown, not "no trip")
+select * from hist_days where service_date = '2026-11-10';
+```
+
+From Node: `supabase.rpc('gtfs_planned_departures', { p_date, p_stop_code, p_line })`.
+`p_line` = `null` returns all lines at the stop. Trips after midnight that belong to the previous
+service day (GTFS times >= 24:00) are included under the calendar date they actually run.
+
+Past days come from the daily GTFS archive of the Public Knowledge Workshop (Open Bus Stride):
+`https://openbus-stride-public.s3.eu-west-1.amazonaws.com/gtfs_archive/YYYY/MM/DD/israel-public-transportation.zip`.
+
+```bash
+npm run gtfs:backfill                          # load missing days of the last 35
+npm run gtfs:backfill -- --days 10             # only the last 10 days
+npm run gtfs:backfill -- --date 2026-11-10 --force   # reload one date
+```
+
+### Nightly run (GitHub Actions)
+
+`.github/workflows/gtfs-nightly.yml` (repository root) runs every night at 01:00 UTC
+(03:00 Israel winter time, 04:00 summer): `npm run gtfs:import`. Past days are not filled
+automatically; a night that failed can be filled by hand with `npm run gtfs:backfill -- --date YYYY-MM-DD`.
+
+- Needs the repository secret `DATABASE_URL` (Settings > Secrets and variables > Actions).
+- Scheduled workflows run only from the default branch (`main`).
+- Manual run: Actions > GTFS nightly import > Run workflow.
+- A failed run makes GitHub email the repository owner; every run is also logged in `gtfs_feeds`.
+- If `gtfs.mot.gov.il` refuses the download (it may block servers abroad), the import uses
+  today's copy from the archive above.

@@ -11,7 +11,8 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "test": "node --test",
-    "gtfs:import": "node scripts/gtfs-import.js"
+    "gtfs:import": "node scripts/gtfs-import.js",
+    "gtfs:backfill": "node scripts/gtfs-backfill.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

@@ -322,7 +322,8 @@ The `gtfs_*` tables only hold the current feed, which covers today and the comin
 For past dates, every import also saves **today's** plan into the `hist_*` tables
 (`db/gtfs_history.sql`, never dropped), and deletes days older than `GTFS_HISTORY_DAYS` (default 35).
 
-Rows are content-addressed (`*_key` = md5 of the content, as uuid). An unchanged stop, route, stop
+Rows are content-addressed (`content_hash` = md5 of the content, as uuid; rows reference each other
+by short integer `*_key`s). An unchanged stop, route, stop
 list, timing, trip or service group is stored once, however many days use it. Each day only adds
 `hist_service_days` rows (~10k): which service groups ran on that date. `hist_days` lists the
 covered dates and the file each came from.

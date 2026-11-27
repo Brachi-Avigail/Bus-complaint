@@ -136,6 +136,37 @@ CREATE TABLE IF NOT EXISTS public.hist_days (
   loaded_at           timestamptz NOT NULL DEFAULT now()
 );
 
+-- Every planned trip, on every service date it ran, at every stop of its pattern.
+-- The one place that joins the hist_* tables; the functions below filter it
+-- (Postgres pushes their WHERE conditions down into the joins).
+-- Times are seconds after midnight of service_date and may be >= 24:00.
+-- trip_key is the stable trip id (GTFS trip_id changes with every feed).
+CREATE OR REPLACE VIEW public.hist_stop_trips WITH (security_invoker = true) AS
+SELECT sd.service_date,
+       tr.trip_key,
+       tr.direction_id,
+       tr.trip_headsign,
+       tr.origin_departure_sec,
+       tr.origin_departure_sec + po.offset_sec AS departure_sec,
+       r.agency_name,
+       r.route_short_name,
+       r.route_desc,
+       r.route_long_name,
+       s.stop_id,
+       s.stop_code,
+       s.stop_name,
+       ps.stop_sequence,
+       ps.pickup_type
+FROM hist_stops s
+JOIN hist_pattern_stops   ps ON ps.stop_key = s.stop_key
+JOIN hist_patterns        pa ON pa.pattern_key = ps.pattern_key
+JOIN hist_routes          r  ON r.route_key = pa.route_key
+JOIN hist_profiles        pf ON pf.pattern_key = pa.pattern_key
+JOIN hist_profile_offsets po ON po.profile_key = pf.profile_key AND po.stop_sequence = ps.stop_sequence
+JOIN hist_trips           tr ON tr.profile_key = pf.profile_key
+JOIN hist_service_trips   st ON st.trip_key = tr.trip_key
+JOIN hist_service_days    sd ON sd.service_key = st.service_key;
+
 -- Planned departures of a line (or of all lines when p_line is NULL) from a stop
 -- on a calendar date. Covers trips of the previous service day that run after
 -- midnight (GTFS times >= 24:00). planned_at is local Israel time.
@@ -167,33 +198,71 @@ AS $$
   -- caller's query, a top-level DISTINCT + ORDER BY can fail
   SELECT d.* FROM (
   SELECT DISTINCT
-         sd.service_date + make_interval(secs => tr.origin_departure_sec + po.offset_sec) AS planned_at,
-         sd.service_date,
-         tr.origin_departure_sec + po.offset_sec AS departure_sec,
-         r.agency_name,
-         r.route_short_name,
-         r.route_desc,
-         r.route_long_name,
-         tr.trip_headsign,
-         s.stop_id,
-         s.stop_name,
-         ps.stop_sequence,
-         ps.pickup_type
-  FROM hist_stops s
-  JOIN hist_pattern_stops   ps ON ps.stop_key = s.stop_key
-  JOIN hist_patterns        pa ON pa.pattern_key = ps.pattern_key
-  JOIN hist_routes          r  ON r.route_key = pa.route_key
-  JOIN hist_profiles        pf ON pf.pattern_key = pa.pattern_key
-  JOIN hist_profile_offsets po ON po.profile_key = pf.profile_key AND po.stop_sequence = ps.stop_sequence
-  JOIN hist_trips           tr ON tr.profile_key = pf.profile_key
-  JOIN hist_service_trips   st ON st.trip_key = tr.trip_key
-  JOIN hist_service_days    sd ON sd.service_key = st.service_key
-                              AND sd.service_date IN (p_date - 1, p_date)
-  WHERE s.stop_code = p_stop_code
-    AND (p_line IS NULL OR r.route_short_name = p_line)
-    AND (sd.service_date + make_interval(secs => tr.origin_departure_sec + po.offset_sec))::date = p_date
+         v.service_date + make_interval(secs => v.departure_sec) AS planned_at,
+         v.service_date,
+         v.departure_sec,
+         v.agency_name,
+         v.route_short_name,
+         v.route_desc,
+         v.route_long_name,
+         v.trip_headsign,
+         v.stop_id,
+         v.stop_name,
+         v.stop_sequence,
+         v.pickup_type
+  FROM hist_stop_trips v
+  WHERE v.stop_code = p_stop_code
+    AND v.service_date IN (p_date - 1, p_date)
+    AND (p_line IS NULL OR v.route_short_name = p_line)
+    AND (v.service_date + make_interval(secs => v.departure_sec))::date = p_date
   ) d
   ORDER BY d.planned_at, d.route_short_name;
+$$;
+
+-- Trips of a line that stop at a stop and leave their FIRST stop (origin) between
+-- p_from and p_to (local Israel time, inclusive). Used to check a departure time
+-- keyed by a caller. Trips after midnight (origin time >= 24:00) belong to the
+-- previous service day, so that day is searched too.
+-- Service days come from hist_service_days (calendar already applied per date).
+CREATE OR REPLACE FUNCTION public.gtfs_trips_by_origin_departure(
+  p_stop_code integer,
+  p_line      text,
+  p_from      timestamp,
+  p_to        timestamp
+)
+RETURNS TABLE (
+  trip_key              integer,
+  service_date          date,
+  origin_departure_at   timestamp,
+  origin_departure_sec  integer,
+  direction_id          smallint,
+  trip_headsign         text,
+  agency_name           text,
+  route_desc            text,
+  route_long_name       text
+)
+LANGUAGE sql
+STABLE
+SET search_path = public
+AS $$
+  SELECT d.* FROM (
+  SELECT DISTINCT
+         v.trip_key,
+         v.service_date,
+         v.service_date + make_interval(secs => v.origin_departure_sec) AS origin_departure_at,
+         v.origin_departure_sec,
+         v.direction_id,
+         v.trip_headsign,
+         v.agency_name,
+         v.route_desc,
+         v.route_long_name
+  FROM hist_stop_trips v
+  WHERE v.stop_code = p_stop_code
+    AND v.route_short_name = p_line
+    AND v.service_date BETWEEN p_from::date - 1 AND p_to::date
+    AND v.service_date + make_interval(secs => v.origin_departure_sec) BETWEEN p_from AND p_to
+  ) d
+  ORDER BY d.origin_departure_at, d.trip_key;
 $$;
 
 -- Access: RLS on, no policies. Only the server key (service_role) may read / execute.
@@ -215,11 +284,23 @@ BEGIN
     END IF;
   END LOOP;
 
-  REVOKE ALL ON FUNCTION public.gtfs_planned_departures(date, integer, text) FROM PUBLIC;
+  -- The view runs as the caller (security_invoker), so RLS on the tables still applies
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
-    REVOKE ALL ON FUNCTION public.gtfs_planned_departures(date, integer, text) FROM anon, authenticated;
+    REVOKE ALL ON public.hist_stop_trips FROM anon, authenticated;
   END IF;
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
-    GRANT EXECUTE ON FUNCTION public.gtfs_planned_departures(date, integer, text) TO service_role;
+    REVOKE ALL ON public.hist_stop_trips FROM service_role;
+    GRANT SELECT ON public.hist_stop_trips TO service_role;
   END IF;
+
+  FOREACH t IN ARRAY ARRAY['public.gtfs_planned_departures(date, integer, text)',
+                           'public.gtfs_trips_by_origin_departure(integer, text, timestamp, timestamp)'] LOOP
+    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', t);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+      EXECUTE format('REVOKE ALL ON FUNCTION %s FROM anon, authenticated', t);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+      EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role', t);
+    END IF;
+  END LOOP;
 END $$;
